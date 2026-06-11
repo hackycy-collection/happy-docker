@@ -29,6 +29,8 @@ const upstreamRepo = env.UPSTREAM_REPO || 'https://github.com/slopus/happy.git';
 const upstreamRef = env.UPSTREAM_REF || 'main';
 const upstreamDir = env.UPSTREAM_DIR || 'upstream';
 const tag = args[0] || env.TAG || 'latest';
+const platforms = env.PLATFORMS || env.PLATFORM || 'linux/amd64,linux/arm64';
+const buildxBuilder = env.BUILDX_BUILDER || 'happy-docker-builder';
 
 let tencentUsername = env.TENCENT_USERNAME || env.TCR_USERNAME || '';
 let tencentPassword = env.TENCENT_PASSWORD || env.TCR_PASSWORD || '';
@@ -78,6 +80,7 @@ async function main() {
   });
 
   ensureBuildxBuilder();
+  console.log(`Using Docker build platforms: ${platforms}`);
 
   for (const image of images) {
     const imageRef = `${registry}/${namespace}/${image.name}`;
@@ -87,6 +90,8 @@ async function main() {
     run('docker', [
       'buildx',
       'build',
+      '--platform',
+      platforms,
       '--file',
       dockerfilePath,
       '--label',
@@ -113,11 +118,14 @@ Environment variables:
   TENCENT_PASSWORD  Tencent Cloud Container Registry password
   REGISTRY          Docker registry, default: ccr.ccs.tencentyun.com
   NAMESPACE         Tencent Cloud namespace, default: sooosin
+  PLATFORMS         Docker build platforms, default: linux/amd64,linux/arm64
+  BUILDX_BUILDER    Docker buildx builder name, default: happy-docker-builder
   UPSTREAM_DIR      Local clone directory, default: upstream
   UPSTREAM_REF      Upstream branch or tag, default: main
 
 Examples:
   TENCENT_USERNAME=100000842583 TENCENT_PASSWORD='***' node scripts/deploy.js latest
+  PLATFORMS=linux/amd64,linux/arm64 TENCENT_USERNAME=100000842583 TENCENT_PASSWORD='***' node scripts/deploy.js latest
   TCR_USERNAME=100000842583 TCR_PASSWORD='***' TAG=2026-06-11 node scripts/deploy.js`);
 }
 
@@ -140,10 +148,12 @@ function prepareUpstreamRepository(upstreamPath) {
 }
 
 function ensureBuildxBuilder() {
-  const inspectResult = spawnSync('docker', ['buildx', 'inspect'], { stdio: 'ignore' });
+  const inspectResult = spawnSync('docker', ['buildx', 'inspect', buildxBuilder], { stdio: 'ignore' });
 
   if (inspectResult.status !== 0) {
-    run('docker', ['buildx', 'create', '--use']);
+    run('docker', ['buildx', 'create', '--name', buildxBuilder, '--driver', 'docker-container', '--use']);
+  } else {
+    run('docker', ['buildx', 'use', buildxBuilder]);
   }
 
   run('docker', ['buildx', 'inspect', '--bootstrap']);
