@@ -31,6 +31,7 @@ const upstreamDir = env.UPSTREAM_DIR || 'upstream';
 const tag = args[0] || env.TAG || 'latest';
 const platforms = env.PLATFORMS || env.PLATFORM || 'linux/amd64,linux/arm64';
 const buildxBuilder = env.BUILDX_BUILDER || 'happy-docker-builder';
+const upstreamMarkerFile = '.happy-docker-upstream.json';
 
 let tencentUsername = env.TENCENT_USERNAME || env.TCR_USERNAME || '';
 let tencentPassword = env.TENCENT_PASSWORD || env.TCR_PASSWORD || '';
@@ -70,9 +71,8 @@ async function main() {
   }
 
   const upstreamPath = path.resolve(repoRoot, upstreamDir);
-  prepareUpstreamRepository(upstreamPath);
-
-  const upstreamSha = runCapture('git', ['-C', upstreamPath, 'rev-parse', 'HEAD']);
+  const upstreamSha = prepareUpstreamRepository(upstreamPath);
+  patchUpstreamDockerfiles(upstreamPath);
 
   console.log(`Logging in to ${registry}...`);
   run('docker', ['login', registry, '--username', tencentUsername, '--password-stdin'], {
@@ -114,7 +114,7 @@ function usage() {
   console.log(`Usage: scripts/deploy.js [tag]
 
 Environment variables:
-  TENCENT_USERNAME  Tencent Cloud account ID, for example 100000842583
+  TENCENT_USERNAME  Tencent Cloud account ID, for example 'uname'
   TENCENT_PASSWORD  Tencent Cloud Container Registry password
   REGISTRY          Docker registry, default: ccr.ccs.tencentyun.com
   NAMESPACE         Tencent Cloud namespace, default: sooosin
@@ -124,27 +124,133 @@ Environment variables:
   UPSTREAM_REF      Upstream branch or tag, default: main
 
 Examples:
-  TENCENT_USERNAME=100000842583 TENCENT_PASSWORD='***' node scripts/deploy.js latest
-  PLATFORMS=linux/amd64,linux/arm64 TENCENT_USERNAME=100000842583 TENCENT_PASSWORD='***' node scripts/deploy.js latest
-  TCR_USERNAME=100000842583 TCR_PASSWORD='***' TAG=2026-06-11 node scripts/deploy.js`);
+  TENCENT_USERNAME='uname' TENCENT_PASSWORD='***' node scripts/deploy.js latest
+  PLATFORMS=linux/amd64,linux/arm64 TENCENT_USERNAME='uname' TENCENT_PASSWORD='***' node scripts/deploy.js latest
+  TCR_USERNAME='uname' TCR_PASSWORD='***' TAG=2026-06-11 node scripts/deploy.js`);
 }
 
 function prepareUpstreamRepository(upstreamPath) {
-  const gitDir = path.join(upstreamPath, '.git');
+  assertSafeUpstreamPath(upstreamPath);
 
-  if (fs.existsSync(gitDir)) {
-    console.log(`Updating upstream repository in ${path.relative(repoRoot, upstreamPath) || upstreamPath}...`);
-    run('git', ['-C', upstreamPath, 'fetch', '--depth', '1', 'origin', upstreamRef]);
-    run('git', ['-C', upstreamPath, 'checkout', '--detach', 'FETCH_HEAD']);
+  const upstreamParent = path.dirname(upstreamPath);
+  const upstreamName = path.basename(upstreamPath);
+  const tempPath = path.join(upstreamParent, `.${upstreamName}.tmp-${process.pid}-${Date.now()}`);
+  const displayPath = path.relative(repoRoot, upstreamPath) || upstreamPath;
+
+  fs.mkdirSync(upstreamParent, { recursive: true });
+  fs.rmSync(tempPath, { recursive: true, force: true });
+
+  try {
+    console.log(`Fetching upstream repository into ${displayPath} without .git...`);
+    run('git', ['clone', '--depth', '1', '--branch', upstreamRef, upstreamRepo, tempPath]);
+
+    const upstreamSha = runCapture('git', ['-C', tempPath, 'rev-parse', 'HEAD']);
+    fs.rmSync(path.join(tempPath, '.git'), { recursive: true, force: true });
+    fs.writeFileSync(
+      path.join(tempPath, upstreamMarkerFile),
+      `${JSON.stringify({ repo: upstreamRepo, ref: upstreamRef, sha: upstreamSha }, null, 2)}\n`,
+    );
+
+    assertSafeToReplaceUpstreamPath(upstreamPath);
+    fs.rmSync(upstreamPath, { recursive: true, force: true });
+    fs.renameSync(tempPath, upstreamPath);
+
+    return upstreamSha;
+  } catch (error) {
+    fs.rmSync(tempPath, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function assertSafeUpstreamPath(upstreamPath) {
+  const relativePath = path.relative(repoRoot, upstreamPath);
+
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    throw new Error(`UPSTREAM_DIR must resolve inside the repository and cannot be the repository root: ${upstreamPath}`);
+  }
+}
+
+function assertSafeToReplaceUpstreamPath(upstreamPath) {
+  if (!fs.existsSync(upstreamPath)) {
     return;
   }
 
-  if (fs.existsSync(upstreamPath)) {
-    throw new Error(`${upstreamPath} exists but is not a Git repository. Remove it or set UPSTREAM_DIR.`);
+  const stat = fs.statSync(upstreamPath);
+
+  if (!stat.isDirectory()) {
+    throw new Error(`${upstreamPath} exists but is not a directory. Remove it or set UPSTREAM_DIR.`);
   }
 
-  console.log(`Cloning upstream repository into ${path.relative(repoRoot, upstreamPath) || upstreamPath}...`);
-  run('git', ['clone', '--depth', '1', '--branch', upstreamRef, upstreamRepo, upstreamPath]);
+  if (fs.existsSync(path.join(upstreamPath, upstreamMarkerFile))) {
+    return;
+  }
+
+  if (fs.existsSync(path.join(upstreamPath, '.git'))) {
+    const remoteUrl = runCapture('git', ['-C', upstreamPath, 'config', '--get', 'remote.origin.url']);
+
+    if (normalizeGitUrl(remoteUrl) === normalizeGitUrl(upstreamRepo)) {
+      return;
+    }
+  }
+
+  throw new Error(`${upstreamPath} already exists and does not look like a managed upstream cache. Remove it or set UPSTREAM_DIR.`);
+}
+
+function normalizeGitUrl(url) {
+  return url.trim().replace(/\.git$/, '');
+}
+
+function patchUpstreamDockerfiles(upstreamPath) {
+  const dockerfilePath = path.join(upstreamPath, 'Dockerfile');
+
+  if (!fs.existsSync(dockerfilePath)) {
+    return;
+  }
+
+  const replacements = [
+    {
+      from: 'RUN apt-get update && apt-get install -y python3 make g++ build-essential && rm -rf /var/lib/apt/lists/*',
+      to: makeAptInstallRun('python3 make g++ build-essential'),
+    },
+    {
+      from: 'RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*',
+      to: makeAptInstallRun('ffmpeg curl'),
+    },
+  ];
+
+  let dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+  let patched = false;
+
+  for (const replacement of replacements) {
+    if (dockerfile.includes(replacement.from)) {
+      dockerfile = dockerfile.replace(replacement.from, replacement.to);
+      patched = true;
+    }
+  }
+
+  if (patched) {
+    fs.writeFileSync(dockerfilePath, dockerfile);
+    console.log('Patched upstream Dockerfile apt installs with retries.');
+  }
+}
+
+function makeAptInstallRun(packages) {
+  return `RUN set -eux; \\
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80-retries; \\
+    echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries; \\
+    echo 'Acquire::https::Timeout "30";' >> /etc/apt/apt.conf.d/80-retries; \\
+    echo 'Acquire::http::Pipeline-Depth "0";' >> /etc/apt/apt.conf.d/80-retries; \\
+    for attempt in 1 2 3 4 5; do \\
+      if apt-get update && apt-get install -y --no-install-recommends ${packages}; then \\
+        break; \\
+      fi; \\
+      if [ "$attempt" = "5" ]; then \\
+        exit 1; \\
+      fi; \\
+      rm -rf /var/lib/apt/lists/*; \\
+      sleep $((attempt * 5)); \\
+    done; \\
+    rm -rf /var/lib/apt/lists/*`;
 }
 
 function ensureBuildxBuilder() {

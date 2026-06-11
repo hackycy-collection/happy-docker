@@ -14,10 +14,9 @@ TENCENT_USERNAME=xxxxxxxx TENCENT_PASSWORD='你的腾讯云镜像密码' node sc
 PLATFORMS=linux/amd64 TENCENT_USERNAME=xxxxxxxx TENCENT_PASSWORD='你的腾讯云镜像密码' node scripts/deploy.js latest
 ```
 
-脚本会 clone 或更新上游 `slopus/happy` 到本地 `upstream/` 目录，并构建推送：
+脚本会获取上游 `slopus/happy` 到本地 `upstream/` 目录，并移除 `.git`，以纯源码快照作为 Docker 构建上下文：
 
 - `Dockerfile.webapp` -> `ccr.ccs.tencentyun.com/sooosin/happy-app:<tag>`
 - `Dockerfile` -> `ccr.ccs.tencentyun.com/sooosin/happy-server:<tag>`
 
 `upstream/` 已加入 `.gitignore`，不会被提交到当前仓库。
-
