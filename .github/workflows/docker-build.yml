@@ -41,11 +41,16 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Tencent Cloud Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.USERNAME }}
-          password: ${{ secrets.PASSWORD }}
+        env:
+          TENCENT_USERNAME: ${{ secrets.USERNAME }}
+          TENCENT_PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          if [ -z "$TENCENT_USERNAME" ] || [ -z "$TENCENT_PASSWORD" ]; then
+            echo "::error::Missing GitHub Secrets: USERNAME and PASSWORD are required."
+            exit 1
+          fi
+
+          printf '%s\n' "$TENCENT_PASSWORD" | docker login "$REGISTRY" --username "$TENCENT_USERNAME" --password-stdin
 
       - name: Build and push ${{ matrix.image }} Docker image
         uses: docker/build-push-action@v6
